@@ -1,5 +1,7 @@
 #include "Pch.h"
 #include "Commands.h"
+// libxe's CommonLibSF replaces REL::Module/REL::Segment with REX::FModule/FModuleSection.
+#include <REX/FModule.h>
 #include <sstream>
 #include <thread>
 #include <algorithm>
@@ -386,14 +388,14 @@ namespace Commands
 
 	static std::span<RE::SCRIPT_FUNCTION> FindScriptTableByScanInData()
 	{
-		auto module = REL::Module::GetSingleton();
-		auto dataSeg = module->segment(REL::Segment::data);
-		if (dataSeg.size() == 0) return {};
+		const auto module = REX::FModule::GetExecutingModule();
+		const auto dataSeg = module.GetSection(".data");
+		if (dataSeg.GetSize() == 0) return {};
 
 		static constexpr size_t kEntrySize = 0x58;
 		static constexpr size_t kMinConsecutive = 5;
-		const auto start = dataSeg.address();
-		const auto end = start + dataSeg.size();
+		const auto start = dataSeg.GetAddress();
+		const auto end = start + dataSeg.GetSize();
 
 		for (uintptr_t addr = start; addr < end - (kEntrySize * kMinConsecutive) + 8; addr += 8) {
 			bool match = true;
@@ -401,7 +403,7 @@ namespace Commands
 				if (!IsLikelyScriptEntry(addr + i * kEntrySize)) { match = false; break; }
 			}
 			if (match) {
-				LogMessage(std::format("MCF: ScriptCommands table FOUND by pattern scan in .data at +0x{:X}", addr - module->base()));
+				LogMessage(std::format("MCF: ScriptCommands table FOUND by pattern scan in .data at +0x{:X}", addr - module.GetBaseAddress()));
 				return { reinterpret_cast<RE::SCRIPT_FUNCTION*>(addr), RE::Script::kNumScriptCommands };
 			}
 		}
@@ -411,14 +413,14 @@ namespace Commands
 
 	static std::span<RE::SCRIPT_FUNCTION> FindScriptTableByScan()
 	{
-		auto module = REL::Module::GetSingleton();
-		auto rdataSeg = module->segment(REL::Segment::rdata);
-		if (rdataSeg.size() == 0) return {};
+		const auto module = REX::FModule::GetExecutingModule();
+		const auto rdataSeg = module.GetSection(".rdata");
+		if (rdataSeg.GetSize() == 0) return {};
 
 		static constexpr size_t kEntrySize = 0x58;
 		static constexpr size_t kMinConsecutive = 5;
-		const auto start = rdataSeg.address();
-		const auto end = start + rdataSeg.size();
+		const auto start = rdataSeg.GetAddress();
+		const auto end = start + rdataSeg.GetSize();
 
 		for (uintptr_t addr = start; addr < end - (kEntrySize * kMinConsecutive) + 8; addr += 8) {
 			bool match = true;
@@ -426,7 +428,7 @@ namespace Commands
 				if (!IsLikelyScriptEntry(addr + i * kEntrySize)) { match = false; break; }
 			}
 			if (match) {
-				LogMessage(std::format("MCF: ScriptCommands table FOUND by pattern scan at +0x{:X}", addr - module->base()));
+				LogMessage(std::format("MCF: ScriptCommands table FOUND by pattern scan at +0x{:X}", addr - module.GetBaseAddress()));
 				return { reinterpret_cast<RE::SCRIPT_FUNCTION*>(addr), RE::Script::kNumScriptCommands };
 			}
 		}

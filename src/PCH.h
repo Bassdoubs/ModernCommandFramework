@@ -97,27 +97,6 @@
 #include <vector>
 #include <version>
 
-// Fix: Define TEnumSet for libxe's CommonLibSF
-namespace REX {
-    template <typename T, typename Storage = std::uint32_t>
-    class TEnumSet {
-    public:
-        using value_type = T;
-        using storage_type = Storage;
-        
-        constexpr TEnumSet() = default;
-        constexpr TEnumSet(T a_value) : value(static_cast<Storage>(a_value)) {}
-        
-        constexpr T get() const { return static_cast<T>(value); }
-        constexpr operator T() const { return get(); }
-        
-        constexpr bool operator==(const TEnumSet& a_rhs) const { return value == a_rhs.value; }
-        constexpr bool operator!=(const TEnumSet& a_rhs) const { return value != a_rhs.value; }
-        
-    private:
-        Storage value{0};
-    };
-}
 
 // CommonLibSF (libxe's updated version)
 #include "RE/Starfield.h"

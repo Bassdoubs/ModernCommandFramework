@@ -446,3 +446,39 @@ Built with ❤️ and libxe's CommonLibSF
 #   M o d e r n C o m m a n d F r a m e w o r k -  
  #   M o d e r n C o m m a n d F r a m e w o r k -  
  
+---
+
+## Building (Linux → Windows cross-compile)
+
+This fork adds an [xmake](https://xmake.io) build that cross-compiles the SFSE
+plugin **from Linux** to a Windows x64 DLL, using `clang-cl` + `lld-link` +
+`llvm-rc` against an [xwin](https://github.com/Jake-Shadle/xwin)/MSVC Windows SDK
+tree (referenced here as `~/.vsxwin`).
+
+```sh
+# Provide the dependencies under extern/ first (see below), then:
+xmake f -p windows -a x64 -m releasedbg --toolchain=clang-cl --sdk=$HOME/.vsxwin -y
+xmake build
+```
+
+Output: `build/windows/x64/releasedbg/ModernCommandFramework.dll`.
+Exports: `SFSEPlugin_Version`, `SFSEPlugin_Load`, `RegisterCommand`.
+
+### Dependencies (not committed — `extern/` is git-ignored)
+
+- `extern/commonlibsf/` — CommonLibSF (libxse fork, runtime 1.16.244.0) + nested
+  `commonlib-shared`, built from source. `spdlog` (v1.16.0, std_format + wchar) is
+  pulled transitively via xrepo.
+
+`modules/detect/tools/find_rc.lua` (included) lets xmake locate an `rc` compiler on Linux.
+
+## Credits
+
+Original mod by **mielu91m** — <https://github.com/mielu91m/ModernCommandFramework->.
+This repository is a modified fork that adds the Linux cross-compile build system
+above (and ports a few call sites to the current CommonLibSF API); all mod
+functionality and design are the original author's work.
+
+## License
+
+Distributed under the MIT License — see [LICENSE](LICENSE).

@@ -1,6 +1,6 @@
 #include "PatternScanner.h"
-#include <REL/Module.h>
-#include <REL/Segment.h>
+// libxe's CommonLibSF replaces REL::Module/REL::Segment with REX::FModule/FModuleSection.
+#include <REX/FModule.h>
 #include <span>
 #include <sstream>
 #include <vector>
@@ -99,12 +99,12 @@ namespace MCF::PatternScanner
     
     std::optional<std::uintptr_t> ScanModule(std::string_view a_pattern)
     {
-        auto module = REL::Module::GetSingleton();
-        auto textSegment = module->segment(REL::Segment::text);
-        
+        const auto module = REX::FModule::GetExecutingModule();
+        const auto textSegment = module.GetSection(".text");
+
         std::span<const std::byte> region(
-            reinterpret_cast<const std::byte*>(textSegment.address()),
-            textSegment.size()
+            reinterpret_cast<const std::byte*>(textSegment.GetAddress()),
+            textSegment.GetSize()
         );
         
         return Scan(region, a_pattern);
