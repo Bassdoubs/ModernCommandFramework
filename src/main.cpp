@@ -1,7 +1,13 @@
-#include "Pch.h"
+// PCH.h is force-included by the build (-FIPCH.h); an explicit include here would
+// re-parse it after the precompiled blob and redefine Plugin::NAME/Version.
 #include "Commands.h"
 #include <fstream>
 #include <iostream>
+
+// Defined below (after the anonymous namespace). Forward-declare it so
+// MessageCallback, which lives in the anonymous namespace above the definition,
+// can call it. (Commands.cpp declares the same signature.)
+void LogMessage(const std::string& message);
 
 namespace
 {
@@ -18,7 +24,21 @@ namespace
 
 	void MessageCallback(SFSE::MessagingInterface::Message* a_msg) noexcept
 	{
-		// Stub implementation - no message handling
+		if (!a_msg) {
+			return;
+		}
+		// The game's ScriptCommands table is not populated during plugin load
+		// (kPostLoad/kPostPostLoad), so command injection attempted there fails.
+		// Retry once game data has loaded, when the table is available.
+		switch (a_msg->type) {
+		case SFSE::MessagingInterface::kPostDataLoad:
+		case SFSE::MessagingInterface::kPostPostDataLoad:
+			LogMessage(std::format("MCF: message {} received - retrying ScriptCommands install", a_msg->type));
+			Commands::OnGameDataLoaded();
+			break;
+		default:
+			break;
+		}
 	}
 }
 

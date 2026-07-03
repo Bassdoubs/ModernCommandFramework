@@ -1,4 +1,4 @@
-#include "Pch.h"
+// PCH.h is force-included by the build (-FIPCH.h); see main.cpp.
 #include "Commands.h"
 // libxe's CommonLibSF replaces REL::Module/REL::Segment with REX::FModule/FModuleSection.
 #include <REX/FModule.h>
@@ -447,9 +447,12 @@ namespace Commands
 					return { raw, RE::Script::kNumScriptCommands };
 				}
 			}
-			return {};
+			// The relocation resolved but the table reads empty: either it is not
+			// populated yet (too early) or the pointer is wrong for this build.
+			// Fall through to a .data pattern scan instead of giving up.
+		} else {
+			LogMessage("MCF: RE::Script::GetScriptCommands() returned null - trying .data scan...");
 		}
-		LogMessage("MCF: RE::Script::GetScriptCommands() returned null - trying .data scan...");
 		return FindScriptTableByScanInData();
 	}
 
@@ -1068,6 +1071,23 @@ namespace Commands
 		}).detach();
 	}
 
+	void OnGameDataLoaded()
+	{
+		if (!kEnableScriptTableInjection || g_scriptSafInstalled) {
+			return;
+		}
+		// "saf" is registered by SAF during PostPostLoad, before this fires. Only
+		// attempt the install if that registration happened.
+		{
+			std::unique_lock l{ regLock };
+			if (!registrations.contains("saf")) {
+				return;
+			}
+		}
+		LogMessage("MCF: game data loaded - installing saf into ScriptCommands table");
+		InstallSafScriptCommand();
+	}
+
 	void ExecuteCommand(void* arg1, char* a_cmd)
 	{
 		if (!a_cmd) {
@@ -1213,7 +1233,12 @@ namespace Commands
 		registrations.insert(std::make_pair(nameStr, a_func));
 		LogMessage(std::format("MCF: Command {} registered", a_name));
 		if (nameStr == "saf" && kEnableScriptTableInjection) {
-			InstallSafScriptCommand();
+			// The ScriptCommands table is usually not populated this early (during
+			// plugin load). Try once in case it is, but defer the real install and
+			// retry loop to OnGameDataLoaded() (SFSE kPostDataLoad), when the table
+			// is available. Starting the retry worker here would only spin uselessly
+			// against an empty table and give up before data finishes loading.
+			TryInstallSafScriptCommand(true);
 		}
 		// Note: mcf_clearcache does not install to ScriptCommands because the table is unavailable during InstallHooks()
 		// It is available through the internal MCF system when dispatcher callsite hook is enabled
