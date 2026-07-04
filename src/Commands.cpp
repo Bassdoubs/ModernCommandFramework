@@ -447,13 +447,29 @@ namespace Commands
 					return { raw, RE::Script::kNumScriptCommands };
 				}
 			}
-			// The relocation resolved but the table reads empty: either it is not
-			// populated yet (too early) or the pointer is wrong for this build.
-			// Fall through to a .data pattern scan instead of giving up.
+			// The relocation resolved but the table reads empty in the first 20
+			// slots: either it is not populated yet (too early) or the resolved
+			// pointer is wrong for this build. DO NOT blind-scan .data for a
+			// look-alike table — that produced a false positive at +0x590D400 on
+			// 1.16.244 and iterating it crashed the game at PostDataLoad
+			// (ACCESS_VIOLATION, Commands.cpp:868). Log what we actually resolved
+			// so the address can be verified, then fail safe (retry later).
+			const auto module = REX::FModule::GetExecutingModule();
+			const auto rva = reinterpret_cast<uintptr_t>(raw) - module.GetBaseAddress();
+			std::string firstNames;
+			for (size_t i = 0; i < 5 && i < RE::Script::kNumScriptCommands; ++i) {
+				const char* name = raw[i].functionName;
+				if (!firstNames.empty()) firstNames += " | ";
+				firstNames += (name && strlen(name) < 64) ? name : "<empty>";
+			}
+			LogMessage(std::format(
+				"MCF: ScriptCommands REL::ID resolved to +0x{:X} but first 20 slots read empty "
+				"(first5: {}). Failing safe (no .data scan) - will retry later.",
+				rva, firstNames));
 		} else {
-			LogMessage("MCF: RE::Script::GetScriptCommands() returned null - trying .data scan...");
+			LogMessage("MCF: RE::Script::GetScriptCommands() returned null - failing safe (no .data scan).");
 		}
-		return FindScriptTableByScanInData();
+		return {};
 	}
 
 	static std::span<RE::SCRIPT_FUNCTION> GetConsoleCommandsTable()
