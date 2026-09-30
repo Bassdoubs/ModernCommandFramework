@@ -91,9 +91,18 @@ namespace MCF
 
 	typedef void (*CommandCallback)(const simple_array<simple_string_view>& a_args, const char* a_fullString, ConsoleInterface* a_intfc);
 
+	// Pass-through of SCRIPT_FUNCTION::ExecuteFunction_t a_object / a_objectContainer (MS x64).
+	typedef void (*CommandCallbackWithContext)(
+		const simple_array<simple_string_view>& a_args,
+		const char* a_fullString,
+		ConsoleInterface* a_intfc,
+		RE::TESObjectREFR* a_object,
+		RE::TESObjectREFR* a_objectContainer);
+
 	namespace detail
 	{
 		typedef void (*RegCommand_Def)(const char* a_name, MCF::CommandCallback a_func);
+		typedef void (*RegCommandWithContext_Def)(const char* a_name, MCF::CommandCallbackWithContext a_func);
 	}
 
 	inline bool RegisterCommand(const char* a_name, CommandCallback a_func) {
@@ -102,6 +111,18 @@ namespace MCF
 			const auto addr = GetProcAddress(hndl, "RegisterCommand");
 			if (addr != NULL) {
 				(reinterpret_cast<detail::RegCommand_Def>(addr))(a_name, a_func);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	inline bool RegisterCommandWithContext(const char* a_name, CommandCallbackWithContext a_func) {
+		const auto hndl = GetModuleHandleA("ModernCommandFramework.dll");
+		if (hndl != NULL) {
+			const auto addr = GetProcAddress(hndl, "RegisterCommandWithContext");
+			if (addr != NULL) {
+				(reinterpret_cast<detail::RegCommandWithContext_Def>(addr))(a_name, a_func);
 				return true;
 			}
 		}

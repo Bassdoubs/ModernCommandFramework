@@ -17,7 +17,7 @@ add_moduledirs("modules")
 includes("extern/commonlibsf")
 
 set_project("ModernCommandFramework")
-set_version("2.0.0")
+set_version("5.1.5")
 set_license("MIT")
 set_languages("c++23")
 set_warnings("allextra")
@@ -51,7 +51,8 @@ target("ModernCommandFramework")
     add_ldflags(
         "/EXPORT:SFSEPlugin_Version",
         "/EXPORT:SFSEPlugin_Load",
-        "/EXPORT:RegisterCommand",
+		"/EXPORT:RegisterCommand",
+        "/EXPORT:RegisterCommandWithContext",
         { force = true }
     )
 

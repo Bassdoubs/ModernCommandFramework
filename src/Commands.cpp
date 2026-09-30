@@ -6,16 +6,16 @@
 #include <thread>
 #include <algorithm>
 
-// SFSEPlugin_Version definition
+// SFSEPlugin_Version definition — MCF 5.0 for Starfield 1.16.244 / AL format 5
 DLLEXPORT SFSE::PluginVersionData SFSEPlugin_Version{
 	SFSE::PluginVersionData::kVersion,
 	Plugin::Version,
 	"ModernCommandFramework",
 	"Mielu91",
-	1, // addressIndependence (UsesSigScanning)
-	1, // structureCompatibility (HasNoStructUse)
+	1u << 2, // Address Library v2
+	1u << 0, // HasNoStructUse
 	{SFSE::RUNTIME_LATEST.pack()},
-	0, // xseMinimum
+	REL::Version{ 0, 2, 21, 0 }.pack(), // xseMinimum SFSE 0.2.21
 	0, // reservedNonBreaking
 	0  // reservedBreaking
 };
@@ -82,6 +82,8 @@ namespace Util
 
 namespace Commands
 {
+	// MCF 5.1: Execute hook OFF (5.0 ON crashed pre-menu on 1.16.244).
+	// Commands are installed into ConsoleCommands after PostDataLoad instead.
 	static constexpr bool kEnableLegacyExecuteHook = false;
 	static constexpr bool kEnableScriptResolverProbeHook = false;
 	static constexpr bool kEnableDispatcherCallsiteHook = false;
@@ -96,10 +98,21 @@ namespace Commands
 	static std::array<RE::SCRIPT_PARAMETER, 8> g_scriptSafParams{};
 	static std::atomic<bool> g_scriptInstallWorkerStarted = false;
 	static std::atomic<std::uint32_t> g_dispatcherHookHitCount = 0;
+	// Persistent names for per-command ConsoleCommands injection (5.1.3, 0-param + preserve slot output).
+	static std::vector<std::unique_ptr<std::string>> g_ownedCommandNames;
+	static std::unordered_set<std::string> g_consoleCmdsInstalled;
+	static std::atomic<bool> g_allCmdsInstallWorkerStarted = false;
 	class Interface;
+	bool TryInstallAllRegisteredConsoleCommands(bool logFailures);
+	bool TryInstallOneConsoleCommand(const std::string& a_nameLower, bool logFailures);
 	extern std::mutex regLock;
 	extern std::unordered_map<std::string, MCF::CommandCallback> registrations;
+	extern std::unordered_map<std::string, MCF::CommandCallbackWithContext> registrationsWithContext;
 	extern Interface* intfc;
+
+	// Compile-time ABI markers for the context callback (MS x64 pointers).
+	static_assert(sizeof(void*) == 8, "MCF context callback expects 64-bit pointers");
+	static_assert(sizeof(MCF::CommandCallbackWithContext) == sizeof(void*), "callback must be a single function pointer");
 
 	std::uint64_t ResolveIdWithFallback(std::uint64_t commonlibId, std::uint64_t fallbackId, const char* name)
 	{
@@ -199,20 +212,208 @@ namespace Commands
 			"Script::GetScriptCommands");
 	}
 
+	static constexpr std::uint64_t kIdGetConsoleHandle = 166314;
+	static constexpr std::uint64_t kIdGetRefrFromHandle = 72399;
+	static constexpr std::uint64_t kIdConsoleReferencesManager = 879512;
+	// versionlib-1-16-244-0.bin (format 5) — verified offline before this build.
+	static constexpr std::uint32_t kExpectGetConsoleHandle = 0x0324B760;
+	static constexpr std::uint32_t kExpectGetRefrFromHandle = 0x00EA6AF0;
+	static constexpr std::uint32_t kExpectConsoleReferencesManager = 0x05D90DF0;
+
+	bool IsReadableMemory(const void* a_ptr, std::size_t a_size) noexcept
+	{
+		if (!a_ptr || a_size == 0) {
+			return false;
+		}
+		const auto addr = reinterpret_cast<std::uintptr_t>(a_ptr);
+		if (addr == 0 || addr == static_cast<std::uintptr_t>(-1) || (addr & (sizeof(void*) - 1)) != 0) {
+			return false;
+		}
+		std::size_t checked = 0;
+		while (checked < a_size) {
+			MEMORY_BASIC_INFORMATION mbi{};
+			const auto cur = reinterpret_cast<const void*>(addr + checked);
+			if (VirtualQuery(cur, &mbi, sizeof(mbi)) == 0) {
+				return false;
+			}
+			if (mbi.State != MEM_COMMIT) {
+				return false;
+			}
+			const auto protect = mbi.Protect & 0xFF;
+			const bool readable =
+				protect == PAGE_READONLY ||
+				protect == PAGE_READWRITE ||
+				protect == PAGE_WRITECOPY ||
+				protect == PAGE_EXECUTE_READ ||
+				protect == PAGE_EXECUTE_READWRITE ||
+				protect == PAGE_EXECUTE_WRITECOPY;
+			if (!readable || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+				return false;
+			}
+			const auto regionBase = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+			const auto regionEnd = regionBase + mbi.RegionSize;
+			if (addr + checked >= regionEnd) {
+				return false;
+			}
+			checked += static_cast<std::size_t>(regionEnd - (addr + checked));
+		}
+		return true;
+	}
+
+	bool ConfirmIdOffset(std::uint64_t a_id, std::uint32_t a_expected, const char* a_name, std::uint64_t& a_outOffset) noexcept
+	{
+		a_outOffset = 0;
+		try {
+			const REL::Relocation<std::byte*> reloc{ REL::ID(a_id) };
+			a_outOffset = reloc.offset();
+		} catch (...) {
+			LogMessage(std::format("MCF: DIAG ID {} ({}) threw while resolving — WILL NOT CALL", a_name, a_id));
+			return false;
+		}
+		if (a_outOffset == 0) {
+			LogMessage(std::format("MCF: DIAG ID {} ({}) resolved offset=0 — WILL NOT CALL", a_name, a_id));
+			return false;
+		}
+		const auto matched = static_cast<std::uint32_t>(a_outOffset) == a_expected;
+		LogMessage(std::format(
+			"MCF: DIAG ID {} ({}) offset=0x{:X} expected=0x{:X} match={}",
+			a_name, a_id, a_outOffset, a_expected, matched ? 1 : 0));
+		if (!matched) {
+			LogMessage(std::format("MCF: DIAG ID {} mismatch vs versionlib-1-16-244 — WILL NOT CALL", a_name));
+			return false;
+		}
+		if (!IsReadableMemory(reinterpret_cast<const void*>(REL::Relocation<std::byte*>{ REL::ID(a_id) }.address()), 16)) {
+			LogMessage(std::format("MCF: DIAG ID {} target bytes not readable — WILL NOT CALL", a_name));
+			return false;
+		}
+		return true;
+	}
+
+	void NeutralizeNiPointer(RE::NiPointer<RE::TESObjectREFR>& a_ptr) noexcept
+	{
+		// Skip DecRefCount on a pointer we do not trust (destructor would call into the game).
+		std::memset(reinterpret_cast<void*>(std::addressof(a_ptr)), 0, sizeof(a_ptr));
+	}
+
+	bool ProbeFormFields(const void* a_obj, std::uint32_t& a_formId, std::uint8_t& a_formType) noexcept
+	{
+		a_formId = 0;
+		a_formType = 0;
+		// TESForm layout (CommonLibSF): formID @ 0x28, formType @ 0x2E. Need >= 0x30 readable.
+		if (!IsReadableMemory(a_obj, 0x30)) {
+			return false;
+		}
+		const auto* bytes = reinterpret_cast<const std::uint8_t*>(a_obj);
+		std::memcpy(&a_formId, bytes + 0x28, sizeof(a_formId));
+		a_formType = bytes[0x2E];
+		return true;
+	}
+
 	RE::NiPointer<RE::TESObjectREFR> GetRefrFromHandle(uint32_t handle)
 	{
 		RE::NiPointer<RE::TESObjectREFR> result;
-		REL::Relocation<void(RE::NiPointer<RE::TESObjectREFR>&, uint32_t*)> func(REL::Offset(0xEA7360));
+		std::uint64_t off = 0;
+		if (!ConfirmIdOffset(kIdGetRefrFromHandle, kExpectGetRefrFromHandle, "GetRefrFromHandle", off)) {
+			return result;
+		}
+		LogMessage(std::format("MCF: DIAG before GetRefrFromHandle handle=0x{:08X}", handle));
+		if (handle == 0 || handle == 0xFFFFFFFFu) {
+			LogMessage(std::format("MCF: DIAG skip GetRefrFromHandle — invalid handle 0x{:08X}", handle));
+			return result;
+		}
+
+		using GetRefr_t = void (*)(RE::NiPointer<RE::TESObjectREFR>&, std::uint32_t*);
+		REL::Relocation<GetRefr_t> func{ REL::ID(kIdGetRefrFromHandle) };
 		func(result, &handle);
+
+		auto* raw = result.get();
+		LogMessage(std::format("MCF: DIAG GetRefrFromHandle returned ptr={}", static_cast<const void*>(raw)));
+		if (!raw || reinterpret_cast<std::uintptr_t>(raw) == static_cast<std::uintptr_t>(-1)) {
+			LogMessage("MCF: DIAG GetRefrFromHandle ptr null/sentinel — neutralizing NiPointer");
+			NeutralizeNiPointer(result);
+			return {};
+		}
+		if (!IsReadableMemory(raw, 0x30)) {
+			LogMessage("MCF: DIAG GetRefrFromHandle ptr not safely readable — neutralizing NiPointer, no FormID deref");
+			NeutralizeNiPointer(result);
+			return {};
+		}
+
+		std::uint32_t formId = 0;
+		std::uint8_t formType = 0;
+		if (ProbeFormFields(raw, formId, formType)) {
+			LogMessage(std::format(
+				"MCF: DIAG refr fields formID=0x{:08X} formType=0x{:02X} (raw read, no virtual call)",
+				formId, formType));
+		} else {
+			LogMessage("MCF: DIAG refr fields probe failed after readable check");
+			NeutralizeNiPointer(result);
+			return {};
+		}
 		return result;
 	}
 
 	RE::NiPointer<RE::TESObjectREFR> GetConsoleRefr()
 	{
-		REL::Relocation<uint64_t**> consoleReferencesManager(REL::Offset(0x5D98D70));
-		REL::Relocation<uint32_t* (uint64_t*, uint32_t*)> GetConsoleHandle(REL::Offset(0x324F780));
-		uint32_t outId = 0;
-		GetConsoleHandle(*consoleReferencesManager, &outId);
+		LogMessage("MCF: DIAG GetConsoleRefr ENTER");
+
+		std::uint64_t offMgr = 0;
+		std::uint64_t offHandle = 0;
+		std::uint64_t offRefr = 0;
+		const bool okMgr = ConfirmIdOffset(kIdConsoleReferencesManager, kExpectConsoleReferencesManager, "ConsoleReferencesManager", offMgr);
+		const bool okHandle = ConfirmIdOffset(kIdGetConsoleHandle, kExpectGetConsoleHandle, "GetConsoleHandle", offHandle);
+		const bool okRefr = ConfirmIdOffset(kIdGetRefrFromHandle, kExpectGetRefrFromHandle, "GetRefrFromHandle", offRefr);
+		if (!okMgr || !okHandle || !okRefr) {
+			LogMessage("MCF: DIAG abort GetConsoleRefr — one or more IDs not confirmed for 1.16.244");
+			return {};
+		}
+
+		REL::Relocation<std::uint64_t**> consoleReferencesManager{ REL::ID(kIdConsoleReferencesManager) };
+		const auto mgrSlotAddr = consoleReferencesManager.address();
+		LogMessage(std::format("MCF: DIAG ConsoleReferencesManager slotVA=0x{:X}", mgrSlotAddr));
+		if (!IsReadableMemory(reinterpret_cast<const void*>(mgrSlotAddr), sizeof(void*))) {
+			LogMessage("MCF: DIAG manager slot not readable — WILL NOT CALL GetConsoleHandle");
+			return {};
+		}
+		auto* mgr = *consoleReferencesManager;
+		LogMessage(std::format("MCF: DIAG manager this={}", static_cast<const void*>(mgr)));
+		if (!mgr || reinterpret_cast<std::uintptr_t>(mgr) == static_cast<std::uintptr_t>(-1)) {
+			LogMessage("MCF: DIAG manager null/sentinel — WILL NOT CALL GetConsoleHandle");
+			return {};
+		}
+		if (!IsReadableMemory(mgr, sizeof(void*))) {
+			LogMessage("MCF: DIAG manager object header not readable — WILL NOT CALL GetConsoleHandle");
+			return {};
+		}
+		void** vtable = *reinterpret_cast<void***>(mgr);
+		LogMessage(std::format("MCF: DIAG manager vtable={}", static_cast<const void*>(vtable)));
+		if (!IsReadableMemory(vtable, 0x40)) {
+			LogMessage("MCF: DIAG manager vtable not readable through +0x38 — WILL NOT CALL GetConsoleHandle");
+			return {};
+		}
+		void* method = vtable[0x38 / sizeof(void*)];
+		LogMessage(std::format("MCF: DIAG manager vtable[0x38]={}", method));
+		if (!method || reinterpret_cast<std::uintptr_t>(method) == static_cast<std::uintptr_t>(-1)) {
+			LogMessage("MCF: DIAG manager vtable[0x38] null/sentinel — WILL NOT CALL GetConsoleHandle (would AV)");
+			return {};
+		}
+		if (!IsReadableMemory(method, 16)) {
+			LogMessage("MCF: DIAG manager vtable[0x38] target not readable — WILL NOT CALL GetConsoleHandle");
+			return {};
+		}
+
+		LogMessage("MCF: DIAG before GetConsoleHandle");
+		using GetConsoleHandle_t = std::uint32_t* (*)(std::uint64_t*, std::uint32_t*);
+		REL::Relocation<GetConsoleHandle_t> GetConsoleHandle{ REL::ID(kIdGetConsoleHandle) };
+		std::uint32_t outId = 0;
+		GetConsoleHandle(mgr, &outId);
+		LogMessage(std::format("MCF: DIAG GetConsoleHandle raw handle=0x{:08X} ({})", outId, static_cast<std::int32_t>(outId)));
+
+		if (outId == 0 || outId == 0xFFFFFFFFu) {
+			LogMessage("MCF: DIAG stop — handle 0 or -1, skip GetRefrFromHandle");
+			return {};
+		}
+
 		return GetRefrFromHandle(outId);
 	}
 
@@ -278,6 +479,7 @@ namespace Commands
 	ExecuteCommandFunc OriginalExecuteCommand;
 	std::mutex regLock;
 	std::unordered_map<std::string, MCF::CommandCallback> registrations;
+	std::unordered_map<std::string, MCF::CommandCallbackWithContext> registrationsWithContext;
 	static Interface* intfc = nullptr;
 
 	void InitializeInterface() {
@@ -1089,19 +1291,268 @@ namespace Commands
 
 	void OnGameDataLoaded()
 	{
-		if (!kEnableScriptTableInjection || g_scriptSafInstalled) {
+		if (!kEnableScriptTableInjection) {
 			return;
 		}
-		// "saf" is registered by SAF during PostPostLoad, before this fires. Only
-		// attempt the install if that registration happened.
+
+		LogMessage("MCF: game data loaded - installing registered commands into ConsoleCommands");
+
+		// Legacy SAF path (animation framework) if present.
 		{
 			std::unique_lock l{ regLock };
-			if (!registrations.contains("saf")) {
-				return;
+			if (registrations.contains("saf") && !g_scriptSafInstalled) {
+				l.unlock();
+				InstallSafScriptCommand();
 			}
 		}
-		LogMessage("MCF: game data loaded - installing saf into ScriptCommands table");
-		InstallSafScriptCommand();
+
+		if (TryInstallAllRegisteredConsoleCommands(true)) {
+			LogMessage("MCF: all registered console commands installed");
+			return;
+		}
+
+		if (g_allCmdsInstallWorkerStarted.exchange(true)) {
+			return;
+		}
+
+		std::thread([]() {
+			LogMessage("MCF: Starting delayed ConsoleCommands install retry worker");
+			for (int attempt = 1; attempt <= 120; ++attempt) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(250));
+				if (TryInstallAllRegisteredConsoleCommands(false)) {
+					LogMessage(std::format("MCF: Delayed ConsoleCommands install succeeded on attempt {}", attempt));
+					g_allCmdsInstallWorkerStarted = false;
+					return;
+				}
+			}
+			LogMessage("MCF: Delayed ConsoleCommands install failed after retries");
+			g_allCmdsInstallWorkerStarted = false;
+		}).detach();
+	}
+
+	bool MCFGenericConsoleExecute(
+		const RE::SCRIPT_PARAMETER*,
+		const char* a_scriptText,
+		RE::TESObjectREFR* a_object,
+		RE::TESObjectREFR* a_objectContainer,
+		RE::Script*,
+		RE::ScriptLocals*,
+		float* a_result,
+		std::uint32_t*)
+	{
+		// Matches RE::SCRIPT_FUNCTION::ExecuteFunction_t (CommonLibSF Script.h).
+		// Previously a_object / a_objectContainer were unnamed and discarded.
+		auto isMostlyPrintable = [](const std::string& s) {
+			if (s.empty()) {
+				return false;
+			}
+			std::size_t printable = 0;
+			for (unsigned char c : s) {
+				if ((c >= 32 && c <= 126) || c == '\t') {
+					++printable;
+				}
+			}
+			return printable * 100 >= s.size() * 85;
+		};
+
+		auto readLastConsoleHistory = []() -> std::string {
+			const auto path = std::filesystem::path(std::getenv("USERPROFILE")) / "Documents" / "My Games" / "Starfield" / "StarfieldConsoleHistory.log";
+			std::ifstream in(path);
+			if (!in.is_open()) {
+				return {};
+			}
+			std::string line;
+			std::string last;
+			while (std::getline(in, line)) {
+				if (!line.empty()) {
+					last = line;
+				}
+			}
+			return last;
+		};
+
+		std::string cmdLine = a_scriptText ? a_scriptText : "";
+		if (!isMostlyPrintable(cmdLine)) {
+			auto historyCmd = readLastConsoleHistory();
+			if (!historyCmd.empty()) {
+				LogMessage(std::format("MCF: GenericConsole raw looked binary, using history '{}'", historyCmd));
+				cmdLine = historyCmd;
+			}
+		}
+
+		auto args = Util::str_split(cmdLine, " ", '\"');
+		if (args.empty()) {
+			LogMessage("MCF: GenericConsole execute with empty cmdline");
+			return false;
+		}
+
+		const auto cmdName = Util::str_tolower(args[0]);
+		args.erase(args.begin());
+
+		std::unique_lock l{ regLock };
+		auto argsSSV = Util::sv_vec_to_ssv_vec(args);
+		MCF::simple_array<MCF::simple_string_view> argsArr(argsSSV);
+		if (intfc) {
+			intfc->Reset(cmdLine.c_str());
+		}
+
+		if (auto iterCtx = registrationsWithContext.find(cmdName); iterCtx != registrationsWithContext.end()) {
+			LogMessage(std::format(
+				"MCF: GenericConsole dispatching-with-context '{}' args={} a_object={} a_objectContainer={}",
+				cmdName,
+				argsArr.size(),
+				static_cast<const void*>(a_object),
+				static_cast<const void*>(a_objectContainer)));
+			iterCtx->second(argsArr, cmdLine.c_str(), intfc, a_object, a_objectContainer);
+		} else if (auto iter = registrations.find(cmdName); iter != registrations.end()) {
+			LogMessage(std::format("MCF: GenericConsole dispatching '{}' args={}", cmdName, argsArr.size()));
+			iter->second(argsArr, cmdLine.c_str(), intfc);
+		} else {
+			LogMessage(std::format("MCF: GenericConsole no registration for '{}'", cmdName));
+			return false;
+		}
+
+		if (intfc) {
+			intfc->PrintDefault();
+		}
+		if (a_result) {
+			*a_result = 1.0f;
+		}
+		return true;
+	}
+
+	bool TryInstallOneConsoleCommand(const std::string& a_nameLower, bool logFailures)
+	{
+		if (g_consoleCmdsInstalled.contains(a_nameLower)) {
+			return true;
+		}
+
+		auto commands = GetConsoleCommandsTable();
+		if (commands.empty()) {
+			if (logFailures) {
+				LogMessage(std::format("MCF: ConsoleCommands table unavailable for '{}'", a_nameLower));
+			}
+			return false;
+		}
+
+		RE::SCRIPT_FUNCTION* templateEntry = nullptr;
+		RE::SCRIPT_FUNCTION* emptySlot = nullptr;
+		RE::SCRIPT_FUNCTION* existingNamed = nullptr;
+		int bestScore = std::numeric_limits<int>::min();
+
+		for (auto& command : commands) {
+			if (command.functionName && _stricmp(command.functionName, a_nameLower.c_str()) == 0) {
+				existingNamed = std::addressof(command);
+			}
+			const bool emptyName = !command.functionName || command.functionName[0] == '\0';
+			const bool nullExec = !command.executeFunction;
+			if ((emptyName || nullExec) && !emptySlot) {
+				emptySlot = std::addressof(command);
+			}
+			if (command.functionName && command.executeFunction) {
+				// Prefer zero-arg templates — cloning Show (1+ params) caused
+				// "Missing parameter ." for BDDA_* which take no console args.
+				int score = 0;
+				if (command.referenceFunction == 0) {
+					score += 10;
+				}
+				if (command.numParams == 0) {
+					score += 40;
+				} else if (command.numParams <= 2) {
+					score += 5;
+				}
+				if (score > bestScore) {
+					bestScore = score;
+					templateEntry = std::addressof(command);
+				}
+			}
+		}
+
+		// Prefer empty/null slots — never hijack a live named command (stability).
+		RE::SCRIPT_FUNCTION* targetEntry = existingNamed ? existingNamed : emptySlot;
+		if (!targetEntry || !templateEntry) {
+			if (logFailures) {
+				LogMessage(std::format("MCF: No empty ConsoleCommands slot for '{}' (empty={}, template={})", a_nameLower, emptySlot != nullptr, templateEntry != nullptr));
+			}
+			return false;
+		}
+
+		// `output` is the console function code / opcode (SFSE: eOutput, base 0x100).
+		// v0.1.5 copied ShowGlobalVars.output onto an empty slot → duplicate opcode →
+		// bytecode dispatch hit the native ShowGlobalVars entry.
+		// v0.1.6 forced output=0 → engine prints "Unknown function code 0."
+		// Keep this slot's unique opcode (SFSE pattern: hijack BetaComment, keep eOutput).
+		const auto slotIndex = static_cast<std::uint32_t>(targetEntry - commands.data());
+		const auto kConsoleBase = static_cast<std::uint32_t>(RE::Script::kConsoleOpBase);
+		const auto kConsoleEnd = kConsoleBase + static_cast<std::uint32_t>(RE::Script::kNumConsoleCommands);
+		std::uint32_t preservedOutput = targetEntry->output;
+		if (preservedOutput < kConsoleBase || preservedOutput >= kConsoleEnd) {
+			preservedOutput = kConsoleBase + slotIndex;
+		}
+
+		auto ownedName = std::make_unique<std::string>(a_nameLower);
+
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(targetEntry, sizeof(RE::SCRIPT_FUNCTION), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+			LogMessage(std::format("MCF: VirtualProtect failed for ConsoleCommands '{}'", a_nameLower));
+			return false;
+		}
+
+		*targetEntry = *templateEntry;
+		targetEntry->functionName = ownedName->c_str();
+		targetEntry->shortName = ownedName->c_str();
+		targetEntry->helpString = ownedName->c_str();
+		// Zero-arg signature: console parser must accept bare `BDDA_Test`.
+		targetEntry->numParams = 0;
+		targetEntry->params = nullptr;
+		targetEntry->executeFunction = &MCFGenericConsoleExecute;
+		targetEntry->output = preservedOutput;
+		targetEntry->referenceFunction = 0;
+		// Keep template compileFunction: default compile emits `output` into bytecode;
+		// dispatch then finds THIS entry by unique opcode and calls our executeFunction.
+		// Do not install an Execute-signature "compile stub" (wrong Compile_t ABI).
+
+		DWORD tmpProtect = 0;
+		(void)VirtualProtect(targetEntry, sizeof(RE::SCRIPT_FUNCTION), oldProtect, &tmpProtect);
+
+		g_ownedCommandNames.push_back(std::move(ownedName));
+		g_consoleCmdsInstalled.insert(a_nameLower);
+		LogMessage(std::format(
+			"MCF: Installed '{}' into ConsoleCommands (template='{}', numParams=0, output=0x{:X})",
+			a_nameLower,
+			templateEntry->functionName ? templateEntry->functionName : "<null>",
+			preservedOutput));
+		return true;
+	}
+
+	bool TryInstallAllRegisteredConsoleCommands(bool logFailures)
+	{
+		std::vector<std::string> names;
+		{
+			std::unique_lock l{ regLock };
+			names.reserve(registrations.size() + registrationsWithContext.size());
+			for (const auto& [name, _] : registrations) {
+				names.push_back(name);
+			}
+			for (const auto& [name, _] : registrationsWithContext) {
+				names.push_back(name);
+			}
+		}
+
+		if (names.empty()) {
+			if (logFailures) {
+				LogMessage("MCF: no registrations to install into ConsoleCommands");
+			}
+			return true;
+		}
+
+		bool allOk = true;
+		for (const auto& name : names) {
+			if (!TryInstallOneConsoleCommand(name, logFailures)) {
+				allOk = false;
+			}
+		}
+		return allOk;
 	}
 
 	void ExecuteCommand(void* arg1, char* a_cmd)
@@ -1125,6 +1576,17 @@ namespace Commands
 		LogMessage(std::format("[MCF] ExecuteCommand: parsed command='{}', args={}", args[0], args.size() - 1));
 		
 		std::unique_lock l{ regLock };
+		if (auto iterCtx = registrationsWithContext.find(Util::str_tolower(args[0])); iterCtx != registrationsWithContext.end()) {
+			LogMessage(std::format("[MCF] ExecuteCommand: context-handler found for '{}' (a_object=null; legacy hook)", args[0]));
+			args.erase(args.begin());
+			auto argsSSV = Util::sv_vec_to_ssv_vec(args);
+			MCF::simple_array<MCF::simple_string_view> argsArr(argsSSV);
+			if (intfc) intfc->Reset(cmdView.c_str());
+			iterCtx->second(argsArr, cmdView.c_str(), intfc, nullptr, nullptr);
+			if (intfc) intfc->PrintDefault();
+			LogMessage("[MCF] ExecuteCommand: EXIT (handled-with-context-null)");
+			return;
+		}
 		if (auto iter = registrations.find(Util::str_tolower(args[0])); iter != registrations.end()) {
 			LogMessage(std::format("[MCF] ExecuteCommand: handler found for '{}'", args[0]));
 
@@ -1205,9 +1667,10 @@ namespace Commands
 		}
 
 		if (kEnableLegacyExecuteHook) {
-			REL::Relocation<uintptr_t> hookLoc{ REL::Offset(0x324F2E0).address() + 0xD0 };
+			// Address Library ID (format 5) — not a hardcoded RVA
+			REL::Relocation<uintptr_t> hookLoc{ REL::ID(166307), 0xD2 };
 			OriginalExecuteCommand = reinterpret_cast<ExecuteCommandFunc>(trampoline->write_call<5>(hookLoc.address(), &ExecuteCommand));
-			LogMessage("MCF: Installed command hook (legacy ExecuteHook)");
+			LogMessage("MCF: Installed command hook (ExecuteHook via REL::ID 166307+0xD2)");
 		} else {
 			LogMessage("MCF: Execute hook disabled (stability mode)");
 		}
@@ -1242,26 +1705,39 @@ namespace Commands
 			return;
 		}
 
-		if (registrations.contains(nameStr)) {
+		if (registrations.contains(nameStr) || registrationsWithContext.contains(nameStr)) {
 			LogMessage(std::format("MCF: A plugin tried to register command '{}', but that command has already been registered", a_name));
 			return;
 		}
 		registrations.insert(std::make_pair(nameStr, a_func));
 		LogMessage(std::format("MCF: Command {} registered", a_name));
-		if (nameStr == "saf" && kEnableScriptTableInjection) {
-			// The ScriptCommands table is usually not populated this early (during
-			// plugin load). Try once in case it is, but defer the real install and
-			// retry loop to OnGameDataLoaded() (SFSE kPostDataLoad), when the table
-			// is available. Starting the retry worker here would only spin uselessly
-			// against an empty table and give up before data finishes loading.
-			TryInstallSafScriptCommand(true);
+		// Defer ConsoleCommands injection to OnGameDataLoaded (PostDataLoad).
+		// Early install fails: tables empty at plugin load. ExecuteHook stays OFF (5.1).
+	}
+
+	void RegisterCommandWithContext(const char* a_name, MCF::CommandCallbackWithContext a_func)
+	{
+		std::unique_lock l{ regLock };
+		std::string nameStr = Util::str_tolower(a_name);
+		if (nameStr.empty()) {
+			return;
 		}
-		// Note: mcf_clearcache does not install to ScriptCommands because the table is unavailable during InstallHooks()
-		// It is available through the internal MCF system when dispatcher callsite hook is enabled
+
+		if (registrations.contains(nameStr) || registrationsWithContext.contains(nameStr)) {
+			LogMessage(std::format("MCF: A plugin tried to register-with-context '{}', but that command has already been registered", a_name));
+			return;
+		}
+		registrationsWithContext.insert(std::make_pair(nameStr, a_func));
+		LogMessage(std::format("MCF: Command {} registered (with executeFunction context)", a_name));
 	}
 }
 
 DLLEXPORT void RegisterCommand(const char* a_name, MCF::CommandCallback a_func)
 {
 	Commands::RegisterCommand(a_name, a_func);
+}
+
+DLLEXPORT void RegisterCommandWithContext(const char* a_name, MCF::CommandCallbackWithContext a_func)
+{
+	Commands::RegisterCommandWithContext(a_name, a_func);
 }

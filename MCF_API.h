@@ -77,23 +77,26 @@ namespace MCF
 	public:
 		virtual RE::NiPointer<RE::TESObjectREFR> GetSelectedReference() = 0;
 
-		//Converts a hexadecimal string to its corresponding form (i.e. 00000014 for player, leading zeros are optional).
-		//Returns nullptr if string does not point to a valid form.
 		virtual RE::TESForm* HexStrToForm(const simple_string_view& a_str) = 0;
 
 		virtual void PrintLn(const simple_string_view& a_txt) = 0;
 
-		//This will prevent the command text from being appended to the console log.
-		//i.e. usually if you enter a command like "tfc 1" into the console, the text "tfc 1" would be printed to the console.
-		//Note: Must be called before the first call to PrintLn.
 		virtual void PreventDefaultPrint() = 0;
 	};
 
 	typedef void (*CommandCallback)(const simple_array<simple_string_view>& a_args, const char* a_fullString, ConsoleInterface* a_intfc);
 
+	typedef void (*CommandCallbackWithContext)(
+		const simple_array<simple_string_view>& a_args,
+		const char* a_fullString,
+		ConsoleInterface* a_intfc,
+		RE::TESObjectREFR* a_object,
+		RE::TESObjectREFR* a_objectContainer);
+
 	namespace detail
 	{
 		typedef void (*RegCommand_Def)(const char* a_name, MCF::CommandCallback a_func);
+		typedef void (*RegCommandWithContext_Def)(const char* a_name, MCF::CommandCallbackWithContext a_func);
 	}
 
 	inline bool RegisterCommand(const char* a_name, CommandCallback a_func) {
@@ -102,6 +105,18 @@ namespace MCF
 			const auto addr = GetProcAddress(hndl, "RegisterCommand");
 			if (addr != NULL) {
 				(reinterpret_cast<detail::RegCommand_Def>(addr))(a_name, a_func);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	inline bool RegisterCommandWithContext(const char* a_name, CommandCallbackWithContext a_func) {
+		const auto hndl = GetModuleHandleA("ModernCommandFramework.dll");
+		if (hndl != NULL) {
+			const auto addr = GetProcAddress(hndl, "RegisterCommandWithContext");
+			if (addr != NULL) {
+				(reinterpret_cast<detail::RegCommandWithContext_Def>(addr))(a_name, a_func);
 				return true;
 			}
 		}

@@ -33,7 +33,7 @@ namespace
 		switch (a_msg->type) {
 		case SFSE::MessagingInterface::kPostDataLoad:
 		case SFSE::MessagingInterface::kPostPostDataLoad:
-			LogMessage(std::format("MCF: message {} received - retrying ScriptCommands install", a_msg->type));
+			LogMessage(std::format("MCF: message {} received - installing registered ConsoleCommands", a_msg->type));
 			Commands::OnGameDataLoaded();
 			break;
 		default:
@@ -65,7 +65,7 @@ DLLEXPORT bool SFSEAPI SFSEPlugin_Load(const SFSE::LoadInterface* a_sfse)
 	SFSE::Init(a_sfse, false);
 	InitializeLogging();
 
-	LogMessage(std::format("{} v{} loaded", Plugin::NAME, Plugin::Version));
+	LogMessage(std::format("{} v{}.1.5 loaded (context-ref-diag, ExecuteHook OFF)", Plugin::NAME, Plugin::Version));
 	LogMessage("Built with libxe's updated CommonLibSF");
 	LogMessage("About to call InstallHooks()...");
 
