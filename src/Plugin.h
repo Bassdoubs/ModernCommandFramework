@@ -12,7 +12,7 @@ using namespace std::literals;
 
 namespace Plugin {
     inline constexpr auto NAME = "ModernCommandFramework"sv;
-    // Log shows "v5.1.6"; build is 5.1.6 (hotkey-opcode-fix, ExecuteHook OFF).
+    // Log shows "v5.1.7"; build is 5.1.7 (exec-thunk name resolve, ExecuteHook OFF).
     inline constexpr auto Version = 5ULL;
 }
 #endif  // MCF_PLUGIN_H

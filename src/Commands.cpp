@@ -2,9 +2,11 @@
 #include "Commands.h"
 // libxe's CommonLibSF replaces REL::Module/REL::Segment with REX::FModule/FModuleSection.
 #include <REX/FModule.h>
+#include <array>
 #include <sstream>
 #include <thread>
 #include <algorithm>
+#include <utility>
 
 // SFSEPlugin_Version definition — MCF 5.0 for Starfield 1.16.244 / AL format 5
 DLLEXPORT SFSE::PluginVersionData SFSEPlugin_Version{
@@ -101,7 +103,26 @@ namespace Commands
 	// Persistent names for per-command ConsoleCommands injection (5.1.3, 0-param + preserve slot output).
 	static std::vector<std::unique_ptr<std::string>> g_ownedCommandNames;
 	static std::unordered_set<std::string> g_consoleCmdsInstalled;
+	// opcode (SCRIPT_FUNCTION::output) -> lowercase command name (hotkey dispatch proof).
+	static std::unordered_map<std::uint32_t, std::string> g_opcodeToCmdName;
 	static std::atomic<bool> g_allCmdsInstallWorkerStarted = false;
+
+	// Per-slot execute thunks: all BDDA commands used to share one MCFGenericConsoleExecute, which
+	// then recovered the name from StarfieldConsoleHistory.log when a_scriptText was bytecode.
+	// Hotkeys echo visually but often do NOT update that file → Identify dispatched Capture.
+	// Each installed command gets a unique ExecuteFunction_t that knows its name (ContextRef intact).
+	static constexpr std::size_t kMaxExecThunks = 32;
+	static std::array<std::string, kMaxExecThunks> g_execThunkNames{};
+	static std::size_t g_execThunkCount = 0;
+
+	bool MCFDispatchConsoleCommand(
+		const std::string& a_cmdNameLower,
+		const char* a_scriptText,
+		RE::TESObjectREFR* a_object,
+		RE::TESObjectREFR* a_objectContainer,
+		float* a_result,
+		const char* a_resolveSource,
+		std::uint32_t a_opcode);
 	class Interface;
 	bool TryInstallAllRegisteredConsoleCommands(bool logFailures);
 	bool TryInstallOneConsoleCommand(const std::string& a_nameLower, bool logFailures);
@@ -1330,7 +1351,80 @@ namespace Commands
 		}).detach();
 	}
 
-	bool MCFGenericConsoleExecute(
+	bool MCFDispatchConsoleCommand(
+		const std::string& a_cmdNameLower,
+		const char* a_scriptText,
+		RE::TESObjectREFR* a_object,
+		RE::TESObjectREFR* a_objectContainer,
+		float* a_result,
+		const char* a_resolveSource,
+		std::uint32_t a_opcode)
+	{
+		const auto index = a_opcode >= static_cast<std::uint32_t>(RE::Script::kConsoleOpBase)
+			? (a_opcode - static_cast<std::uint32_t>(RE::Script::kConsoleOpBase))
+			: 0xFFFFFFFFu;
+		LogMessage(std::format(
+			"MCF: COMPILE_DISPATCH name='{}' opcode=0x{:X} index={} source={} a_object={}",
+			a_cmdNameLower,
+			a_opcode,
+			index == 0xFFFFFFFFu ? -1 : static_cast<int>(index),
+			a_resolveSource ? a_resolveSource : "?",
+			static_cast<const void*>(a_object)));
+
+		std::unique_lock l{ regLock };
+		std::vector<std::string_view> args;
+		std::string probeStorage;
+		if (a_scriptText && a_scriptText[0] != '\0') {
+			probeStorage = a_scriptText;
+			bool printable = true;
+			for (unsigned char c : probeStorage) {
+				if (!((c >= 32 && c <= 126) || c == '\t')) {
+					printable = false;
+					break;
+				}
+			}
+			if (printable) {
+				args = Util::str_split(probeStorage, " ", '\"');
+				if (!args.empty()) {
+					args.erase(args.begin());
+				}
+			}
+		}
+
+		auto argsSSV = Util::sv_vec_to_ssv_vec(args);
+		MCF::simple_array<MCF::simple_string_view> argsArr(argsSSV);
+		const char* full = a_scriptText && a_scriptText[0] ? a_scriptText : a_cmdNameLower.c_str();
+		if (intfc) {
+			intfc->Reset(full);
+		}
+
+		if (auto iterCtx = registrationsWithContext.find(a_cmdNameLower); iterCtx != registrationsWithContext.end()) {
+			LogMessage(std::format(
+				"MCF: GenericConsole dispatching-with-context '{}' args={} a_object={} a_objectContainer={}",
+				a_cmdNameLower,
+				argsArr.size(),
+				static_cast<const void*>(a_object),
+				static_cast<const void*>(a_objectContainer)));
+			iterCtx->second(argsArr, full, intfc, a_object, a_objectContainer);
+		} else if (auto iter = registrations.find(a_cmdNameLower); iter != registrations.end()) {
+			LogMessage(std::format("MCF: GenericConsole dispatching '{}' args={}", a_cmdNameLower, argsArr.size()));
+			iter->second(argsArr, full, intfc);
+		} else {
+			LogMessage(std::format("MCF: GenericConsole no registration for '{}'", a_cmdNameLower));
+			return false;
+		}
+
+		if (intfc) {
+			intfc->PrintDefault();
+		}
+		if (a_result) {
+			*a_result = 1.0f;
+		}
+		return true;
+	}
+
+	template <std::size_t I>
+	bool MCFExecThunk(
 		const RE::SCRIPT_PARAMETER*,
 		const char* a_scriptText,
 		RE::TESObjectREFR* a_object,
@@ -1340,8 +1434,40 @@ namespace Commands
 		float* a_result,
 		std::uint32_t*)
 	{
-		// Matches RE::SCRIPT_FUNCTION::ExecuteFunction_t (CommonLibSF Script.h).
-		// Previously a_object / a_objectContainer were unnamed and discarded.
+		static_assert(I < kMaxExecThunks);
+		const auto& name = g_execThunkNames[I];
+		std::uint32_t opcode = 0;
+		if (auto it = g_opcodeToCmdName.begin(); it != g_opcodeToCmdName.end()) {
+			for (const auto& [op, n] : g_opcodeToCmdName) {
+				if (n == name) {
+					opcode = op;
+					break;
+				}
+			}
+		}
+		return MCFDispatchConsoleCommand(name, a_scriptText, a_object, a_objectContainer, a_result, "exec-thunk", opcode);
+	}
+
+	using ExecFn = RE::SCRIPT_FUNCTION::ExecuteFunction_t;
+	template <std::size_t... Is>
+	constexpr auto MakeExecThunkTable(std::index_sequence<Is...>) -> std::array<ExecFn, sizeof...(Is)>
+	{
+		return { &MCFExecThunk<Is>... };
+	}
+	static const auto g_execThunkTable = MakeExecThunkTable(std::make_index_sequence<kMaxExecThunks>{});
+
+	bool MCFGenericConsoleExecute(
+		const RE::SCRIPT_PARAMETER*,
+		const char* a_scriptText,
+		RE::TESObjectREFR* a_object,
+		RE::TESObjectREFR* a_objectContainer,
+		RE::Script* a_script,
+		RE::ScriptLocals*,
+		float* a_result,
+		std::uint32_t*)
+	{
+		// Legacy shared entry (kept for any pre-thunk path). Prefer script->text, then
+		// opcode map from bytecode prefix, then history last-resort (logged as unsafe).
 		auto isMostlyPrintable = [](const std::string& s) {
 			if (s.empty()) {
 				return false;
@@ -1371,12 +1497,27 @@ namespace Commands
 			return last;
 		};
 
+		std::string resolveSource = "scriptText";
+		std::uint32_t opcode = 0;
 		std::string cmdLine = a_scriptText ? a_scriptText : "";
+		if (!isMostlyPrintable(cmdLine) && a_script && a_script->text && isMostlyPrintable(a_script->text)) {
+			cmdLine = a_script->text;
+			resolveSource = "script->text";
+		}
+		if (!isMostlyPrintable(cmdLine) && a_scriptText) {
+			const auto* bytes = reinterpret_cast<const unsigned char*>(a_scriptText);
+			opcode = static_cast<std::uint32_t>(bytes[0] | (static_cast<std::uint32_t>(bytes[1]) << 8));
+			if (auto it = g_opcodeToCmdName.find(opcode); it != g_opcodeToCmdName.end()) {
+				cmdLine = it->second;
+				resolveSource = "bytecode-opcode";
+			}
+		}
 		if (!isMostlyPrintable(cmdLine)) {
 			auto historyCmd = readLastConsoleHistory();
 			if (!historyCmd.empty()) {
-				LogMessage(std::format("MCF: GenericConsole raw looked binary, using history '{}'", historyCmd));
+				LogMessage(std::format("MCF: GenericConsole UNSAFE history fallback '{}'", historyCmd));
 				cmdLine = historyCmd;
+				resolveSource = "history-unsafe";
 			}
 		}
 
@@ -1385,40 +1526,16 @@ namespace Commands
 			LogMessage("MCF: GenericConsole execute with empty cmdline");
 			return false;
 		}
-
 		const auto cmdName = Util::str_tolower(args[0]);
-		args.erase(args.begin());
-
-		std::unique_lock l{ regLock };
-		auto argsSSV = Util::sv_vec_to_ssv_vec(args);
-		MCF::simple_array<MCF::simple_string_view> argsArr(argsSSV);
-		if (intfc) {
-			intfc->Reset(cmdLine.c_str());
+		if (opcode == 0) {
+			for (const auto& [op, n] : g_opcodeToCmdName) {
+				if (n == cmdName) {
+					opcode = op;
+					break;
+				}
+			}
 		}
-
-		if (auto iterCtx = registrationsWithContext.find(cmdName); iterCtx != registrationsWithContext.end()) {
-			LogMessage(std::format(
-				"MCF: GenericConsole dispatching-with-context '{}' args={} a_object={} a_objectContainer={}",
-				cmdName,
-				argsArr.size(),
-				static_cast<const void*>(a_object),
-				static_cast<const void*>(a_objectContainer)));
-			iterCtx->second(argsArr, cmdLine.c_str(), intfc, a_object, a_objectContainer);
-		} else if (auto iter = registrations.find(cmdName); iter != registrations.end()) {
-			LogMessage(std::format("MCF: GenericConsole dispatching '{}' args={}", cmdName, argsArr.size()));
-			iter->second(argsArr, cmdLine.c_str(), intfc);
-		} else {
-			LogMessage(std::format("MCF: GenericConsole no registration for '{}'", cmdName));
-			return false;
-		}
-
-		if (intfc) {
-			intfc->PrintDefault();
-		}
-		if (a_result) {
-			*a_result = 1.0f;
-		}
-		return true;
+		return MCFDispatchConsoleCommand(cmdName, cmdLine.c_str(), a_object, a_objectContainer, a_result, resolveSource.c_str(), opcode);
 	}
 
 	bool TryInstallOneConsoleCommand(const std::string& a_nameLower, bool logFailures)
@@ -1500,6 +1617,13 @@ namespace Commands
 		}
 
 		auto ownedName = std::make_unique<std::string>(a_nameLower);
+		if (g_execThunkCount >= kMaxExecThunks) {
+			LogMessage(std::format("MCF: exec thunk pool exhausted for '{}'", a_nameLower));
+			return false;
+		}
+		const auto thunkIndex = g_execThunkCount;
+		g_execThunkNames[thunkIndex] = a_nameLower;
+		++g_execThunkCount;
 
 		DWORD oldProtect = 0;
 		if (!VirtualProtect(targetEntry, sizeof(RE::SCRIPT_FUNCTION), PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -1514,13 +1638,14 @@ namespace Commands
 		// Zero-arg signature: console parser must accept bare `BDDA_Test`.
 		targetEntry->numParams = 0;
 		targetEntry->params = nullptr;
-		targetEntry->executeFunction = &MCFGenericConsoleExecute;
+		targetEntry->executeFunction = g_execThunkTable[thunkIndex];
 		targetEntry->output = forcedOutput;
 		targetEntry->referenceFunction = 0;
-		// Keep template compileFunction: emits `this->output` into bytecode; runtime
-		// indexes table[output-0x100] → THIS slot → executeFunction (ContextRef a_object).
-		// Do not install an Execute-signature "compile stub" (wrong Compile_t ABI).
-		// Do not call WithContext callbacks from ExecuteCommand hook (a_object would be null).
+		// Keep template compileFunction: engine name-lookup copies SCRIPT_FUNCTION::output
+		// into the line buffer (+0x208) before emit (Starfield.exe ~0xC16AAB). Do NOT
+		// install an Execute-signature "compile stub" (wrong Compile_t ABI, v0.1.6).
+		// Per-command execute thunk carries the name so hotkey bytecode path cannot
+		// mis-resolve via stale console history.
 
 		DWORD tmpProtect = 0;
 		(void)VirtualProtect(targetEntry, sizeof(RE::SCRIPT_FUNCTION), oldProtect, &tmpProtect);
@@ -1531,14 +1656,16 @@ namespace Commands
 
 		g_ownedCommandNames.push_back(std::move(ownedName));
 		g_consoleCmdsInstalled.insert(a_nameLower);
+		g_opcodeToCmdName[forcedOutput] = a_nameLower;
 		LogMessage(std::format(
-			"MCF: Installed '{}' into ConsoleCommands (template='{}', numParams=0, slot={}, priorOut=0x{:X}, output=0x{:X}, indexOk={})",
+			"MCF: Installed '{}' into ConsoleCommands (template='{}', numParams=0, slot={}, priorOut=0x{:X}, output=0x{:X}, indexOk={}, thunk={})",
 			a_nameLower,
 			templateEntry->functionName ? templateEntry->functionName : "<null>",
 			slotIndex,
 			priorOutput,
 			forcedOutput,
-			indexOk));
+			indexOk,
+			thunkIndex));
 		if (priorOutput != forcedOutput) {
 			LogMessage(std::format(
 				"MCF: HOTKEY_OPCODE_FIX '{}' remapped output 0x{:X} -> 0x{:X} (slot {})",
@@ -1547,6 +1674,13 @@ namespace Commands
 				forcedOutput,
 				slotIndex));
 		}
+		LogMessage(std::format(
+			"MCF: OPCODE_MAP '{}' -> opcode=0x{:X} index={} thunk={} exec={}",
+			a_nameLower,
+			forcedOutput,
+			slotIndex,
+			thunkIndex,
+			static_cast<const void*>(reinterpret_cast<const void*>(g_execThunkTable[thunkIndex]))));
 		return indexOk;
 	}
 
