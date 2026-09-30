@@ -65,7 +65,7 @@ DLLEXPORT bool SFSEAPI SFSEPlugin_Load(const SFSE::LoadInterface* a_sfse)
 	SFSE::Init(a_sfse, false);
 	InitializeLogging();
 
-	LogMessage(std::format("{} v{}.1.5 loaded (context-ref-diag, ExecuteHook OFF)", Plugin::NAME, Plugin::Version));
+	LogMessage(std::format("{} v{}.1.6 loaded (hotkey-opcode-fix, ExecuteHook OFF)", Plugin::NAME, Plugin::Version));
 	LogMessage("Built with libxe's updated CommonLibSF");
 	LogMessage("About to call InstallHooks()...");
 

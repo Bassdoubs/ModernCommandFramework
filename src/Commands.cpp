@@ -1477,17 +1477,26 @@ namespace Commands
 			return false;
 		}
 
-		// `output` is the console function code / opcode (SFSE: eOutput, base 0x100).
-		// v0.1.5 copied ShowGlobalVars.output onto an empty slot → duplicate opcode →
-		// bytecode dispatch hit the native ShowGlobalVars entry.
-		// v0.1.6 forced output=0 → engine prints "Unknown function code 0."
-		// Keep this slot's unique opcode (SFSE pattern: hijack BetaComment, keep eOutput).
+		// `output` is the console function opcode. Engine bytecode dispatch indexes
+		// ConsoleCommands as `table[output - kConsoleOpBase]` (see Starfield.exe
+		// compile/run path around Unknown-function). Interactive typing resolves by
+		// *name* and calls executeFunction directly — so a mismatched output still
+		// works when typed, but Hotkeys.ini / ExecuteHotkeyCmd compile→dispatch
+		// misses our slot (echo only, no MCFGenericConsoleExecute).
+		//
+		// ALWAYS force output == kConsoleOpBase + slotIndex. Do not trust a stale
+		// in-range value left on an empty/hijacked slot (v0.1.5–5.1.5 gap).
 		const auto slotIndex = static_cast<std::uint32_t>(targetEntry - commands.data());
 		const auto kConsoleBase = static_cast<std::uint32_t>(RE::Script::kConsoleOpBase);
 		const auto kConsoleEnd = kConsoleBase + static_cast<std::uint32_t>(RE::Script::kNumConsoleCommands);
-		std::uint32_t preservedOutput = targetEntry->output;
-		if (preservedOutput < kConsoleBase || preservedOutput >= kConsoleEnd) {
-			preservedOutput = kConsoleBase + slotIndex;
+		const std::uint32_t priorOutput = targetEntry->output;
+		const std::uint32_t forcedOutput = kConsoleBase + slotIndex;
+		if (forcedOutput >= kConsoleEnd) {
+			LogMessage(std::format(
+				"MCF: slotIndex {} out of ConsoleCommands range for '{}'",
+				slotIndex,
+				a_nameLower));
+			return false;
 		}
 
 		auto ownedName = std::make_unique<std::string>(a_nameLower);
@@ -1506,23 +1515,39 @@ namespace Commands
 		targetEntry->numParams = 0;
 		targetEntry->params = nullptr;
 		targetEntry->executeFunction = &MCFGenericConsoleExecute;
-		targetEntry->output = preservedOutput;
+		targetEntry->output = forcedOutput;
 		targetEntry->referenceFunction = 0;
-		// Keep template compileFunction: default compile emits `output` into bytecode;
-		// dispatch then finds THIS entry by unique opcode and calls our executeFunction.
+		// Keep template compileFunction: emits `this->output` into bytecode; runtime
+		// indexes table[output-0x100] → THIS slot → executeFunction (ContextRef a_object).
 		// Do not install an Execute-signature "compile stub" (wrong Compile_t ABI).
+		// Do not call WithContext callbacks from ExecuteCommand hook (a_object would be null).
 
 		DWORD tmpProtect = 0;
 		(void)VirtualProtect(targetEntry, sizeof(RE::SCRIPT_FUNCTION), oldProtect, &tmpProtect);
 
+		// Verify index invariant used by hotkey/script dispatch.
+		const auto* byOpcode = std::addressof(commands[forcedOutput - kConsoleBase]);
+		const bool indexOk = byOpcode == targetEntry;
+
 		g_ownedCommandNames.push_back(std::move(ownedName));
 		g_consoleCmdsInstalled.insert(a_nameLower);
 		LogMessage(std::format(
-			"MCF: Installed '{}' into ConsoleCommands (template='{}', numParams=0, output=0x{:X})",
+			"MCF: Installed '{}' into ConsoleCommands (template='{}', numParams=0, slot={}, priorOut=0x{:X}, output=0x{:X}, indexOk={})",
 			a_nameLower,
 			templateEntry->functionName ? templateEntry->functionName : "<null>",
-			preservedOutput));
-		return true;
+			slotIndex,
+			priorOutput,
+			forcedOutput,
+			indexOk));
+		if (priorOutput != forcedOutput) {
+			LogMessage(std::format(
+				"MCF: HOTKEY_OPCODE_FIX '{}' remapped output 0x{:X} -> 0x{:X} (slot {})",
+				a_nameLower,
+				priorOutput,
+				forcedOutput,
+				slotIndex));
+		}
+		return indexOk;
 	}
 
 	bool TryInstallAllRegisteredConsoleCommands(bool logFailures)

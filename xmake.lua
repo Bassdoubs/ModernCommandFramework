@@ -17,7 +17,7 @@ add_moduledirs("modules")
 includes("extern/commonlibsf")
 
 set_project("ModernCommandFramework")
-set_version("5.1.5")
+set_version("5.1.6")
 set_license("MIT")
 set_languages("c++23")
 set_warnings("allextra")
